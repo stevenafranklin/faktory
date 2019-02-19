@@ -3,12 +3,12 @@ package webui
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/contribsys/faktory/server"
@@ -32,77 +32,172 @@ var (
 	}
 
 	// these are used in testing only
-	mutex         sync.Mutex
-	defaultServer *server.Server
-	staticHandler = Cache(http.FileServer(&AssetFS{Asset: Asset, AssetDir: AssetDir}))
+	staticHandler = cache(http.FileServer(&AssetFS{Asset: Asset, AssetDir: AssetDir}))
 )
 
 //go:generate ego .
 //go:generate go-bindata -pkg webui -o static.go static/...
 
-func InitialSetup(pwd string) {
-	Password = pwd
-	http.HandleFunc("/static/", staticHandler)
-	http.HandleFunc("/stats", DebugLog(statsHandler))
-
-	http.HandleFunc("/", Log(GetOnly(indexHandler)))
-	http.HandleFunc("/queues", Log(queuesHandler))
-	http.HandleFunc("/queues/", Log(queueHandler))
-	http.HandleFunc("/retries", Log(retriesHandler))
-	http.HandleFunc("/retries/", Log(retryHandler))
-	http.HandleFunc("/scheduled", Log(scheduledHandler))
-	http.HandleFunc("/scheduled/", Log(scheduledJobHandler))
-	http.HandleFunc("/morgue", Log(morgueHandler))
-	http.HandleFunc("/morgue/", Log(deadHandler))
-	http.HandleFunc("/busy", Log(busyHandler))
-	http.HandleFunc("/debug", Log(debugHandler))
-	initLocales()
-
-	server.OnStart(FireItUp)
-}
-
-func FireItUp(svr *server.Server) error {
-	mutex.Lock()
-	defer mutex.Unlock()
-	defaultServer = svr
-	go func() {
-		s := &http.Server{
-			Addr:           ":7420",
-			ReadTimeout:    1 * time.Second,
-			WriteTimeout:   10 * time.Second,
-			MaxHeaderBytes: 1 << 20,
-			Handler:        http.DefaultServeMux,
-		}
-		util.Info("Web server now listening on port 7420")
-		log.Fatal(s.ListenAndServe())
-	}()
-	return nil
-}
+type localeMap map[string]map[string]string
+type assetLookup func(string) ([]byte, error)
 
 var (
-	Password    = ""
-	enableCSRF  = true
-	locales     = map[string]map[string]string{}
-	localeMutex = sync.Mutex{}
+	AssetLookups = []assetLookup{Asset}
+	locales      = localeMap{}
 )
 
-func initLocales() {
-	localeFiles, err := AssetDir("static/locales")
+func init() {
+	files, err := AssetDir("static/locales")
 	if err != nil {
 		panic(err)
 	}
-	for _, filename := range localeFiles {
+	for _, filename := range files {
 		name := strings.Split(filename, ".")[0]
 		locales[name] = nil
 	}
-	translations("en") // eager load English
-	//util.Debugf("Initialized %d locales", len(localeFiles))
+	//util.Debugf("Initialized %d locales", len(files))
+}
+
+type Lifecycle struct {
+	WebUI          *WebUI
+	defaultBinding string
+	closer         func()
+}
+
+func Subsystem(binding string) *Lifecycle {
+	return &Lifecycle{
+		defaultBinding: binding,
+	}
+}
+
+type WebUI struct {
+	Options Options
+	Server  *server.Server
+	Mux     *http.ServeMux
+}
+
+type Options struct {
+	Binding    string
+	Password   string
+	EnableCSRF bool
+}
+
+func defaultOptions() Options {
+	return Options{
+		Password:   "",
+		Binding:    "localhost:7420",
+		EnableCSRF: true,
+	}
+}
+
+func newWeb(s *server.Server, opts Options) *WebUI {
+	ui := &WebUI{
+		Options: opts,
+		Server:  s,
+
+		Mux: http.NewServeMux(),
+	}
+
+	ui.Mux.HandleFunc("/static/", staticHandler)
+	ui.Mux.HandleFunc("/stats", DebugLog(ui, statsHandler))
+
+	ui.Mux.HandleFunc("/", Log(ui, GetOnly(indexHandler)))
+	ui.Mux.HandleFunc("/queues", Log(ui, queuesHandler))
+	ui.Mux.HandleFunc("/queues/", Log(ui, queueHandler))
+	ui.Mux.HandleFunc("/retries", Log(ui, retriesHandler))
+	ui.Mux.HandleFunc("/retries/", Log(ui, retryHandler))
+	ui.Mux.HandleFunc("/scheduled", Log(ui, scheduledHandler))
+	ui.Mux.HandleFunc("/scheduled/", Log(ui, scheduledJobHandler))
+	ui.Mux.HandleFunc("/morgue", Log(ui, morgueHandler))
+	ui.Mux.HandleFunc("/morgue/", Log(ui, deadHandler))
+	ui.Mux.HandleFunc("/busy", Log(ui, busyHandler))
+	ui.Mux.HandleFunc("/debug", Log(ui, debugHandler))
+
+	return ui
+}
+
+func (l *Lifecycle) opts(s *server.Server) Options {
+	opts := defaultOptions()
+	opts.Binding = l.defaultBinding
+	if opts.Binding == "localhost:7420" {
+		opts.Binding = s.Options.String("web", "binding", "localhost:7420")
+	}
+	// Allow the Web UI to have a different password from the command port
+	// so you can rotate user-used passwords and machine-used passwords separately
+	pwd := s.Options.String("web", "password", "")
+	if pwd == "" {
+		pwd = s.Options.Password
+	}
+	opts.Password = pwd
+	return opts
+}
+
+func (l *Lifecycle) Start(s *server.Server) error {
+	uiopts := l.opts(s)
+
+	l.WebUI = newWeb(s, uiopts)
+	closer, err := l.WebUI.Run()
+	if err != nil {
+		return err
+	}
+	l.closer = closer
+	return nil
+}
+
+func (l *Lifecycle) Reload(s *server.Server) error {
+	uiopts := l.opts(s)
+
+	if uiopts != l.WebUI.Options {
+		util.Infof("Reloading web interface")
+		l.closer()
+
+		l.WebUI.Options = uiopts
+		closer, err := l.WebUI.Run()
+		if err != nil {
+			return err
+		}
+		l.closer = closer
+		return nil
+	}
+	return nil
+}
+
+func (l *Lifecycle) Shutdown(s *server.Server) error {
+	if l.closer != nil {
+		util.Debug("Stopping WebUI")
+		l.closer()
+		l.closer = nil
+		l.WebUI = nil
+	}
+	return nil
+}
+
+func (ui *WebUI) Run() (func(), error) {
+	if ui.Options.Binding == ":0" {
+		// disable webui
+		return nil, nil
+	}
+
+	s := &http.Server{
+		Addr:           ui.Options.Binding,
+		ReadTimeout:    1 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 16,
+		Handler:        ui.Mux,
+	}
+
+	go func() {
+		err := s.ListenAndServe()
+		if err != http.ErrServerClosed {
+			util.Error(fmt.Sprintf("%s server crashed", ui.Options.Binding), err)
+		}
+	}()
+	util.Infof("Web server now listening at %s", ui.Options.Binding)
+	return func() { s.Shutdown(context.Background()) }, nil
 }
 
 func translations(locale string) map[string]string {
-	localeMutex.Lock()
 	strs, ok := locales[locale]
-	localeMutex.Unlock()
 	if strs != nil {
 		return strs
 	}
@@ -113,22 +208,22 @@ func translations(locale string) map[string]string {
 
 	if ok {
 		//util.Debugf("Booting the %s locale", locale)
-		content, err := Asset(fmt.Sprintf("static/locales/%s.yml", locale))
-		if err != nil {
-			panic(err)
-		}
-
 		strs := map[string]string{}
-		scn := bufio.NewScanner(bytes.NewReader(content))
-		for scn.Scan() {
-			kv := strings.Split(scn.Text(), ":")
-			if len(kv) == 2 {
-				strs[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		for _, finder := range AssetLookups {
+			content, err := finder(fmt.Sprintf("static/locales/%s.yml", locale))
+			if err != nil {
+				continue
+			}
+
+			scn := bufio.NewScanner(bytes.NewReader(content))
+			for scn.Scan() {
+				kv := strings.Split(scn.Text(), ":")
+				if len(kv) == 2 {
+					strs[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+				}
 			}
 		}
-		localeMutex.Lock()
 		locales[locale] = strs
-		localeMutex.Unlock()
 		return strs
 	}
 
@@ -177,19 +272,23 @@ func localeFromHeader(value string) string {
 	return "en"
 }
 
+func Layout(w io.Writer, req *http.Request, yield func()) {
+	ego_layout(w, req, yield)
+}
+
 /////////////////////////////////////
 
 // The stats handler is hit a lot and adds much noise to the log,
 // quiet it down.
-func DebugLog(pass http.HandlerFunc) http.HandlerFunc {
-	return Setup(pass, true)
+func DebugLog(ui *WebUI, pass http.HandlerFunc) http.HandlerFunc {
+	return setup(ui, pass, true)
 }
 
-func Log(pass http.HandlerFunc) http.HandlerFunc {
-	return Protect(Setup(pass, false))
+func Log(ui *WebUI, pass http.HandlerFunc) http.HandlerFunc {
+	return protect(ui.Options.EnableCSRF, setup(ui, pass, false))
 }
 
-func Setup(pass http.HandlerFunc, debug bool) http.HandlerFunc {
+func setup(ui *WebUI, pass http.HandlerFunc, debug bool) http.HandlerFunc {
 	genericSetup := func(w http.ResponseWriter, r *http.Request) {
 		// this is the entry point for every dynamic request
 		// static assets bypass all this hubbub
@@ -214,11 +313,12 @@ func Setup(pass http.HandlerFunc, debug bool) http.HandlerFunc {
 
 		dctx := &DefaultContext{
 			Context:  r.Context(),
+			webui:    ui,
 			response: w,
 			request:  r,
 			locale:   locale,
 			strings:  translations(locale),
-			csrf:     enableCSRF,
+			csrf:     ui.Options.EnableCSRF,
 		}
 
 		pass(w, r.WithContext(dctx))
@@ -228,13 +328,13 @@ func Setup(pass http.HandlerFunc, debug bool) http.HandlerFunc {
 			util.Infof("%s %s %v", r.Method, r.RequestURI, time.Since(start))
 		}
 	}
-	if Password != "" {
-		return BasicAuth(genericSetup)
+	if ui.Options.Password != "" {
+		return basicAuth(ui.Options.Password, genericSetup)
 	}
 	return genericSetup
 }
 
-func BasicAuth(pass http.HandlerFunc) http.HandlerFunc {
+func basicAuth(pwd string, pass http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		_, password, ok := r.BasicAuth()
 		if !ok {
@@ -242,7 +342,7 @@ func BasicAuth(pass http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "Authorization required", http.StatusUnauthorized)
 			return
 		}
-		if subtle.ConstantTimeCompare([]byte(password), []byte(Password)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(password), []byte(pwd)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Faktory"`)
 			http.Error(w, "Authorization failed", http.StatusUnauthorized)
 			return
@@ -271,17 +371,17 @@ func PostOnly(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func Cache(h http.Handler) http.HandlerFunc {
+func cache(h http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Cache-Control", "public, max-age=3600")
 		h.ServeHTTP(w, r)
 	}
 }
 
-func Protect(h http.HandlerFunc) http.HandlerFunc {
+func protect(enabled bool, h http.HandlerFunc) http.HandlerFunc {
 	hndlr := nosurf.New(h)
 	hndlr.ExemptFunc(func(r *http.Request) bool {
-		return !enableCSRF
+		return !enabled
 	})
 	return func(w http.ResponseWriter, r *http.Request) {
 		hndlr.ServeHTTP(w, r)

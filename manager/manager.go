@@ -10,6 +10,7 @@ import (
 	"github.com/contribsys/faktory/client"
 	"github.com/contribsys/faktory/storage"
 	"github.com/contribsys/faktory/util"
+	"github.com/go-redis/redis"
 )
 
 const (
@@ -68,26 +69,62 @@ type Manager interface {
 	RetryJobs() (int64, error)
 
 	BusyCount(wid string) int
+
+	AddMiddleware(fntype string, fn MiddlewareFunc)
+
+	KV() storage.KV
+	Redis() *redis.Client
 }
 
 func NewManager(s storage.Store) Manager {
 	m := &manager{
 		store:      s,
 		workingMap: map[string]*Reservation{},
+		pushChain:  make(MiddlewareChain, 0),
+		failChain:  make(MiddlewareChain, 0),
+		ackChain:   make(MiddlewareChain, 0),
+		fetchChain: make(MiddlewareChain, 0),
 	}
 	m.loadWorkingSet()
 	return m
+}
+
+func (m *manager) KV() storage.KV {
+	return m.store.Raw()
+}
+
+func (m *manager) Redis() *redis.Client {
+	return m.store.Redis()
+}
+
+func (m *manager) AddMiddleware(fntype string, fn MiddlewareFunc) {
+	switch fntype {
+	case "push":
+		m.pushChain = append(m.pushChain, fn)
+	case "ack":
+		m.ackChain = append(m.ackChain, fn)
+	case "fail":
+		m.failChain = append(m.failChain, fn)
+	case "fetch":
+		m.fetchChain = append(m.fetchChain, fn)
+	default:
+		panic(fmt.Sprintf("Unknown middleware type: %s", fntype))
+	}
 }
 
 type manager struct {
 	store storage.Store
 
 	// Hold the working set in memory so we don't need to burn CPU
-	// marshalling between Rocks and memory when doing 1000s of jobs/sec.
+	// when doing 1000s of jobs/sec.
 	// When client ack's JID, we can lookup reservation
-	// and remove Rocks entry quickly.
+	// and remove stored entry quickly.
 	workingMap   map[string]*Reservation
 	workingMutex sync.RWMutex
+	pushChain    MiddlewareChain
+	fetchChain   MiddlewareChain
+	failChain    MiddlewareChain
+	ackChain     MiddlewareChain
 }
 
 func (m *manager) Push(job *client.Job) error {
@@ -100,6 +137,9 @@ func (m *manager) Push(job *client.Job) error {
 	if job.Args == nil {
 		return fmt.Errorf("All jobs must have an args parameter")
 	}
+	if job.ReserveFor > 86400 {
+		return fmt.Errorf("Jobs cannot be reserved for more than one day")
+	}
 
 	if job.CreatedAt == "" {
 		job.CreatedAt = util.Nows()
@@ -107,11 +147,6 @@ func (m *manager) Push(job *client.Job) error {
 
 	if job.Queue == "" {
 		job.Queue = "default"
-	}
-
-	// Priority can never be negative because of signedness
-	if job.Priority > 9 || job.Priority == 0 {
-		job.Priority = 5
 	}
 
 	if job.At != "" {
@@ -127,11 +162,7 @@ func (m *manager) Push(job *client.Job) error {
 			}
 
 			// scheduler for later
-			err = m.store.Scheduled().AddElement(job.At, job.Jid, data)
-			if err != nil {
-				return err
-			}
-			return nil
+			return m.store.Scheduled().AddElement(job.At, job.Jid, data)
 		}
 	}
 
@@ -145,21 +176,19 @@ func (m *manager) enqueue(job *client.Job) error {
 		return err
 	}
 
-	job.EnqueuedAt = util.Nows()
-	data, err := json.Marshal(job)
-	if err != nil {
-		return err
-	}
-
-	err = q.Push(job.Priority, data)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return callMiddleware(m.pushChain, Ctx{context.Background(), job, m}, func() error {
+		job.EnqueuedAt = util.Nows()
+		data, err := json.Marshal(job)
+		if err != nil {
+			return err
+		}
+		//util.Debugf("pushed: %+v", job)
+		return q.Push(data)
+	})
 }
 
 func (m *manager) Fetch(ctx context.Context, wid string, queues ...string) (*client.Job, error) {
+restart:
 	var first storage.Queue
 
 	for idx, qname := range queues {
@@ -178,7 +207,14 @@ func (m *manager) Fetch(ctx context.Context, wid string, queues ...string) (*cli
 			if err != nil {
 				return nil, err
 			}
-			err = m.reserve(wid, &job)
+			err = callMiddleware(m.fetchChain, Ctx{ctx, &job, m}, func() error {
+				return m.reserve(wid, &job)
+			})
+			if h, ok := err.(halt); ok {
+				// middleware halted the fetch, for whatever reason
+				util.Infof("JID %s: %s", job.Jid, h.Error())
+				goto restart
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -207,7 +243,14 @@ func (m *manager) Fetch(ctx context.Context, wid string, queues ...string) (*cli
 		if err != nil {
 			return nil, err
 		}
-		err = m.reserve(wid, &job)
+		err = callMiddleware(m.fetchChain, Ctx{ctx, &job, m}, func() error {
+			return m.reserve(wid, &job)
+		})
+		if h, ok := err.(halt); ok {
+			// middleware halted the fetch, for whatever reason
+			util.Debugf("JID %s: %s", job.Jid, h.Error())
+			goto restart
+		}
 		if err != nil {
 			return nil, err
 		}

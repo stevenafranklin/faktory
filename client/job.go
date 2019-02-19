@@ -24,7 +24,6 @@ type Job struct {
 	Args  []interface{} `json:"args"`
 
 	// optional
-	Priority   uint8                  `json:"priority,omitempty"`
 	CreatedAt  string                 `json:"created_at,omitempty"`
 	EnqueuedAt string                 `json:"enqueued_at,omitempty"`
 	At         string                 `json:"at,omitempty"`
@@ -43,7 +42,6 @@ func NewJob(jobtype string, args ...interface{}) *Job {
 		Jid:       randomJid(),
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		Retry:     25,
-		Priority:  5,
 	}
 }
 
@@ -55,4 +53,21 @@ func randomJid() string {
 	}
 
 	return base64.RawURLEncoding.EncodeToString(bytes)
+}
+
+func (j *Job) GetCustom(name string) (interface{}, bool) {
+	if j.Custom == nil {
+		return nil, false
+	}
+
+	val, ok := j.Custom[name]
+	return val, ok
+}
+
+func (j *Job) SetCustom(name string, value interface{}) {
+	if j.Custom == nil {
+		j.Custom = map[string]interface{}{}
+	}
+
+	j.Custom[name] = value
 }

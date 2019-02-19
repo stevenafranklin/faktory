@@ -1,5 +1,5 @@
 NAME=faktory
-VERSION=0.7.0
+VERSION=0.9.7
 
 # when fixing packaging bugs but not changing the binary, we increment ITERATION
 ITERATION=1
@@ -10,17 +10,23 @@ ifdef DETECT_RACES
 	TEST_FLAGS += -race
 endif
 
-# contains various secret or machine-specific variables.
-# DEB_PRODUCTION: hostname of a debian-based upstart machine (e.g. Ubuntu {12,14}.04 LTS)
-# RPM_PRODUCTION: hostname of a redhat-based systemd machine (e.g. CentOS 7)
-#include $(HOME)/.local.sh
-
 # TODO I'd love some help making this a proper Makefile
 # with real file dependencies.
 
 .DEFAULT_GOAL := help
 
 all: test
+
+release:
+	cp /tmp/faktory-pro_$(VERSION)-$(ITERATION).macos.tbz packaging/output/systemd
+	@echo Generating release notes
+	ruby .github/notes.rb $(VERSION)
+	@echo Releasing $(NAME) $(VERSION)-$(ITERATION)
+	hub release create v$(VERSION)-$(ITERATION) \
+		-a packaging/output/systemd/faktory_$(VERSION)-$(ITERATION)_amd64.deb \
+		-a packaging/output/systemd/faktory-$(VERSION)-$(ITERATION).x86_64.rpm \
+		-a packaging/output/systemd/faktory-pro_$(VERSION)-$(ITERATION).macos.tbz \
+	 	-F /tmp/release-notes.md -e -o
 
 prepare: ## Download all dependencies
 	@go get github.com/golang/dep/cmd/dep
@@ -32,34 +38,41 @@ prepare: ## Download all dependencies
 test: clean generate ## Execute test suite
 	go test $(TEST_FLAGS) \
 		github.com/contribsys/faktory/client \
+		github.com/contribsys/faktory/cli \
 		github.com/contribsys/faktory/manager \
 		github.com/contribsys/faktory/server \
 		github.com/contribsys/faktory/storage \
 		github.com/contribsys/faktory/test \
 		github.com/contribsys/faktory/util \
-		github.com/contribsys/faktory/webui \
-		github.com/contribsys/faktory/cmd/faktory-cli
+		github.com/contribsys/faktory/webui
 
-dimg: ## Make a Docker image for the current version
+dimg: xbuild ## Make a Docker image for the current version
 	#eval $(shell docker-machine env default)
 	docker build \
-		--build-arg GOLANG_VERSION=1.9.2  \
-		--build-arg ROCKSDB_VERSION=5.9.2 \
-		--tag contribsys/faktory:$(VERSION) .
+		--tag contribsys/faktory:$(VERSION) \
+		--tag contribsys/faktory:latest \
+		.
 
 drun: ## Run Faktory in a local Docker image, see also "make dimg"
-	docker run --rm -it -e "FAKTORY_PASSWORD=${PASSWORD}" \
+	docker run --rm -it -e "FAKTORY_SKIP_PASSWORD=true" \
+		-v faktory-data:/var/lib/faktory \
 		-p 127.0.0.1:7419:7419 \
 		-p 127.0.0.1:7420:7420 \
+		contribsys/faktory:latest /faktory -e production
+
+dmon: ## Monitor Redis within the running Docker image
+	docker run --rm -it -t -i \
 		-v faktory-data:/var/lib/faktory \
-		contribsys/faktory:$(VERSION) /faktory -b 0.0.0.0:7419 -e production
+		contribsys/faktory:latest /usr/bin/redis-cli -s /var/lib/faktory/db/redis.sock monitor
+
+#dinsp:
+	#docker run --rm -it -e "FAKTORY_PASSWORD=${PASSWORD}" \
+		#-p 127.0.0.1:7419:7419 \
+		#-p 127.0.0.1:7420:7420 \
+		#-v faktory-data:/var/lib/faktory \
+		#contribsys/faktory:$(VERSION) /bin/bash
 
 dpush: tag
-	docker build \
-		--build-arg GOLANG_VERSION=1.9.2    \
-		--build-arg ROCKSDB_VERSION=5.9.2   \
-		--tag contribsys/faktory:$(VERSION) \
-		--tag contribsys/faktory:latest .
 	docker push contribsys/faktory:$(VERSION)
 	docker push contribsys/faktory:latest
 
@@ -71,16 +84,18 @@ cover:
 	go tool cover -html=cover.out -o coverage.html
 	open coverage.html
 
-# https://blog.filippo.io/shrink-your-go-binaries-with-this-one-weird-trick/
-# we can't cross-compile when using cgo <cry>
-#	@GOOS=linux GOARCH=amd64
-build: clean generate
-	go build -ldflags="-s -w" -o faktory-cli cmd/faktory-cli/repl.go
-	go build -ldflags="-s -w" -o faktory cmd/faktory/daemon.go
+xbuild: clean generate
+	@GOOS=linux GOARCH=amd64 go build -o $(NAME) cmd/faktory/daemon.go
 
-# this is a separate target because loadtest doesn't need rocksdb or webui
+build: clean generate
+	go build -o $(NAME) cmd/faktory/daemon.go
+
+mon:
+	redis-cli -s ~/.faktory/db/redis.sock
+
+# this is a separate target because loadtest doesn't need redis or webui
 build_load:
-	go build -ldflags="-s -w" -o loadtest test/load/main.go
+	go build -o loadtest test/load/main.go
 
 load: # not war
 	go run test/load/main.go 30000 10
@@ -98,13 +113,10 @@ work: ## Run a simple Ruby worker, see also "make run"
 clean: ## Clean the project, set it up for a new build
 	@rm -f webui/*.ego.go
 	@rm -rf tmp
-	@rm -f main faktory templates.go faktory-cli
+	@rm -f main faktory templates.go
 	@rm -rf packaging/output
 	@mkdir -p packaging/output/upstart
 	@mkdir -p packaging/output/systemd
-
-repl: clean generate ## Run the Faktory CLI
-	go run cmd/faktory-cli/repl.go -l debug -e development
 
 run: clean generate ## Run Faktory daemon locally
 	FAKTORY_PASSWORD=${PASSWORD} go run cmd/faktory/daemon.go -l debug -e development
@@ -116,118 +128,59 @@ ussh:
 	pushd build/ubuntu && vagrant up && vagrant ssh
 
 # gem install fpm
-# https://github.com/jordansissel/fpm/issues/576
-# brew install gnu-tar
-# ln -s /usr/local/bin/gtar /usr/local/bin/gnutar
-package: deb rpm
+# Packaging uses Go's cross compile + fpm so we can build Linux packages on macOS.
+package: clean xbuild deb rpm
 
 version_check:
-	@grep -q $(VERSION) faktory.go || (echo VERSIONS OUT OF SYNC && false)
+	@grep -q $(VERSION) client/faktory.go || (echo VERSIONS OUT OF SYNC && false)
 
-purge_deb:
-	ssh -t $(DEB_PRODUCTION) 'sudo apt-get purge -y $(NAME) && sudo rm -f /etc/faktory' || true
+# these two reload targets are meant to be run within the Vagrant boxes
+reload_rpm:
+	sudo rpm -e $(NAME)
+	sudo yum install -y packaging/output/systemd/$(NAME)-$(VERSION)-$(ITERATION).x86_64.rpm
 
-purge_rpm:
-	ssh -t $(RPM_PRODUCTION) 'sudo rpm -e $(NAME) && sudo rm -f /etc/faktory' || true
+reload_deb:
+	sudo apt-get purge -y $(NAME)
+	sudo dpkg -i packaging/output/systemd/$(NAME)_$(VERSION)-$(ITERATION)_amd64.deb
 
-deploy_deb: clean build_deb purge_deb
-	scp packaging/output/upstart/*.deb $(DEB_PRODUCTION):~
-	ssh $(DEB_PRODUCTION) 'sudo rm -f /etc/faktory && sudo dpkg -i $(NAME)_$(VERSION)-$(ITERATION)_amd64.deb && sudo ./fix && sudo restart faktory || true'
-
-deploy_rpm: clean build_rpm purge_rpm
-	scp packaging/output/systemd/*.rpm $(RPM_PRODUCTION):~
-	ssh -t $(RPM_PRODUCTION) 'sudo rm -f /etc/faktory && sudo yum install -q -y $(NAME)-$(VERSION)-$(ITERATION).x86_64.rpm && sudo ./fix && sudo systemctl restart faktory'
-
-update_deb: clean build_deb
-	scp packaging/output/upstart/*.deb $(DEB_PRODUCTION):~
-	ssh $(DEB_PRODUCTION) 'sudo dpkg -i $(NAME)_$(VERSION)-$(ITERATION)_amd64.deb'
-
-update_rpm: clean build_rpm
-	scp packaging/output/systemd/*.rpm $(RPM_PRODUCTION):~
-	ssh -t $(RPM_PRODUCTION) 'sudo yum install -q -y $(NAME)-$(VERSION)-$(ITERATION).x86_64.rpm'
-
-deploy: deploy_deb deploy_rpm
-purge: purge_deb purge_rpm
-
-build_rpm_upstart:
-	# gem install fpm
-	# brew install rpm
-	fpm -s dir -t rpm -n $(NAME) -v $(VERSION) -p packaging/output/upstart \
-		--rpm-compression bzip2 --rpm-os linux \
-	 	--after-install packaging/scripts/postinst.rpm.upstart \
-	 	--before-remove packaging/scripts/prerm.rpm.upstart \
-		--after-remove packaging/scripts/postrm.rpm.upstart \
-		--url http://contribsys.com/faktory \
-		--description "Background job server" \
-		-m "Contributed Systems LLC <info@contribsys.com>" \
-		--iteration $(ITERATION) --license "GPL 3.0" \
-		--vendor "Contributed Systems" -a amd64 \
-		faktory=/usr/bin/faktory \
-		faktory-cli=/usr/bin/faktory-cli \
-		packaging/root/=/
-
-rpm: version_check faktory faktory-cli
-	# gem install fpm
-	# brew install rpm
+rpm: xbuild
 	fpm -s dir -t rpm -n $(NAME) -v $(VERSION) -p packaging/output/systemd \
+		--depends redis \
 		--rpm-compression bzip2 --rpm-os linux \
 	 	--after-install packaging/scripts/postinst.rpm.systemd \
 	 	--before-remove packaging/scripts/prerm.rpm.systemd \
 		--after-remove packaging/scripts/postrm.rpm.systemd \
-		--url http://contribsys.com/faktory \
+		--url https://contribsys.com/faktory \
 		--description "Background job server" \
 		-m "Contributed Systems LLC <info@contribsys.com>" \
 		--iteration $(ITERATION) --license "GPL 3.0" \
 		--vendor "Contributed Systems" -a amd64 \
 		faktory=/usr/bin/faktory \
-		faktory-cli=/usr/bin/faktory-cli \
 		packaging/root/=/
 
-build_deb_upstart:
-	# gem install fpm
-	fpm -s dir -t deb -n $(NAME) -v $(VERSION) -p packaging/output/upstart \
-		--deb-priority optional --category admin \
-		--deb-compression bzip2 \
-		--no-deb-no-default-config-files \
-	 	--after-install packaging/scripts/postinst.deb.upstart \
-	 	--before-remove packaging/scripts/prerm.deb.upstart \
-		--after-remove packaging/scripts/postrm.deb.upstart \
-		--url http://contribsys.com/faktory \
-		--description "Background job server" \
-		-m "Contributed Systems LLC <info@contribsys.com>" \
-		--iteration $(ITERATION) --license "GPL 3.0" \
-		--vendor "Contributed Systems" -a amd64 \
-		faktory=/usr/bin/faktory \
-		faktory-cli=/usr/bin/faktory-cli \
-		packaging/root/=/
-
-deb: version_check faktory faktory-cli
-	# gem install fpm
+deb: xbuild
 	fpm -s dir -t deb -n $(NAME) -v $(VERSION) -p packaging/output/systemd \
+		--depends redis-server \
 		--deb-priority optional --category admin \
 		--deb-compression bzip2 \
 		--no-deb-no-default-config-files \
 	 	--after-install packaging/scripts/postinst.deb.systemd \
 	 	--before-remove packaging/scripts/prerm.deb.systemd \
 		--after-remove packaging/scripts/postrm.deb.systemd \
-		--url http://contribsys.com/faktory \
+		--url https://contribsys.com/faktory \
 		--description "Background job server" \
 		-m "Contributed Systems LLC <info@contribsys.com>" \
 		--iteration $(ITERATION) --license "GPL 3.0" \
 		--vendor "Contributed Systems" -a amd64 \
 		faktory=/usr/bin/faktory \
-		faktory-cli=/usr/bin/faktory-cli \
 		packaging/root/=/
 
 tag:
 	git tag v$(VERSION)-$(ITERATION) && git push --tags || :
 
 upload:	package tag
-	# gem install -N package_cloud
 	package_cloud push contribsys/faktory/ubuntu/xenial packaging/output/systemd/$(NAME)_$(VERSION)-$(ITERATION)_amd64.deb
-	#package_cloud push contribsys/faktory/ubuntu/trusty packaging/output/upstart/$(NAME)_$(VERSION)-$(ITERATION)_amd64.deb
 	package_cloud push contribsys/faktory/el/7 packaging/output/systemd/$(NAME)-$(VERSION)-$(ITERATION).x86_64.rpm
-	#package_cloud push contribsys/faktory/el/6 packaging/output/upstart/$(NAME)-$(VERSION)-$(ITERATION).x86_64.rpm
 
 .PHONY: help all clean test build package upload
 

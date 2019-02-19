@@ -1,10 +1,12 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
 	"github.com/contribsys/faktory/client"
+	"github.com/contribsys/faktory/storage"
 	"github.com/contribsys/faktory/util"
 )
 
@@ -56,9 +58,9 @@ func (m *manager) loadWorkingSet() error {
 	defer m.workingMutex.Unlock()
 
 	addedCount := 0
-	err := m.store.Working().Each(func(_ int, _ []byte, data []byte) error {
+	err := m.store.Working().Each(func(idx int, entry storage.SortedEntry) error {
 		var res Reservation
-		err := json.Unmarshal(data, &res)
+		err := json.Unmarshal(entry.Value(), &res)
 		if err != nil {
 			return err
 		}
@@ -83,13 +85,13 @@ func (m *manager) reserve(wid string, job *client.Job) error {
 	}
 
 	if timeout < 60 {
-		timeout = DefaultTimeout
 		util.Warnf("Timeout too short %d, 60 seconds minimum", timeout)
+		timeout = DefaultTimeout
 	}
 
 	if timeout > 86400 {
-		timeout = DefaultTimeout
 		util.Warnf("Timeout too long %d, one day maximum", timeout)
+		timeout = DefaultTimeout
 	}
 
 	exp := now.Add(time.Duration(timeout) * time.Second)
@@ -126,7 +128,8 @@ func (m *manager) ack(jid string) (*client.Job, error) {
 		return nil, nil
 	}
 
-	err := m.store.Working().RemoveElement(res.Expiry, jid)
+	// doesn't matter, might not have acknowledged in time
+	_, err := m.store.Working().RemoveElement(res.Expiry, jid)
 	return res.Job, err
 }
 
@@ -138,8 +141,12 @@ func (m *manager) Acknowledge(jid string) (*client.Job, error) {
 
 	if job != nil {
 		m.store.Success()
+		err = callMiddleware(m.ackChain, Ctx{context.Background(), job, m}, func() error {
+			return nil
+		})
 	}
-	return job, nil
+
+	return job, err
 }
 
 func (m *manager) ReapExpiredJobs(timestamp string) (int, error) {

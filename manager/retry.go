@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -81,9 +82,16 @@ func (m *manager) processFailure(jid string, failure *FailPayload) error {
 		return fmt.Errorf("Job not found %s", jid)
 	}
 
-	err := m.store.Working().RemoveElement(res.Expiry, jid)
-	if err != nil {
-		return err
+	// when expiring overdue jobs in the working set, we remove in
+	// bulk so this job is no longer in the working set already.
+	if failure != JobReservationExpired {
+		ok, err := m.store.Working().RemoveElement(res.Expiry, jid)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
 	}
 
 	m.store.Failure()
@@ -109,10 +117,12 @@ func (m *manager) processFailure(jid string, failure *FailPayload) error {
 		}
 	}
 
-	if job.Failure.RetryCount < job.Retry {
-		return retryLater(m.store, job)
-	}
-	return sendToMorgue(m.store, job)
+	return callMiddleware(m.failChain, Ctx{context.Background(), job, m}, func() error {
+		if job.Failure.RetryCount < job.Retry {
+			return retryLater(m.store, job)
+		}
+		return sendToMorgue(m.store, job)
+	})
 }
 
 func retryLater(store storage.Store, job *client.Job) error {

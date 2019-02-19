@@ -1,6 +1,7 @@
 package server
 
 import (
+	"io"
 	"testing"
 	"time"
 
@@ -53,22 +54,23 @@ func TestWorkers(t *testing.T) {
 	assert.Equal(t, 0, workers.Count())
 
 	client := &ClientData{
-		Hostname: "MikeBookPro.local",
-		Wid:      "78629a0f5f3f164f",
+		Hostname:    "MikeBookPro.local",
+		Wid:         "78629a0f5f3f164f",
+		connections: map[io.Closer]bool{},
 	}
 
-	entry, ok := workers.heartbeat(client, false)
+	entry, ok := workers.heartbeat(client, nil)
 	assert.Equal(t, 0, workers.Count())
 	assert.Nil(t, entry)
 	assert.False(t, ok)
 
-	entry, ok = workers.heartbeat(client, true)
+	entry, ok = workers.heartbeat(client, &cls{})
 	assert.Equal(t, 1, workers.Count())
 	assert.NotNil(t, entry)
 	assert.True(t, ok)
 
 	before := time.Now()
-	entry, ok = workers.heartbeat(client, true)
+	entry, ok = workers.heartbeat(client, &cls{})
 	after := time.Now()
 	assert.Equal(t, 1, workers.Count())
 	assert.NotNil(t, entry)
@@ -80,7 +82,14 @@ func TestWorkers(t *testing.T) {
 	assert.Equal(t, 1, workers.Count())
 	assert.Equal(t, 0, count)
 
+	client.connections[cls{}] = true
 	count = workers.reapHeartbeats(time.Now())
 	assert.Equal(t, 0, workers.Count())
 	assert.Equal(t, 1, count)
+}
+
+type cls struct{}
+
+func (c cls) Close() error {
+	return nil
 }
